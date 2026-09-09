@@ -6,13 +6,20 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 from torch.utils.data import Dataset
 
 class TrajAugmenterWrapper(Dataset):
-    def __init__(self, subset, augment=True):
+    def __init__(self, subset, augment=True, crop_ratio=0.7, views='OTR',
+                 sub_ratio=0.15):
         self.subset = subset
         self.augment = augment
+        self.crop_ratio = crop_ratio
         self.min_length = 1
+        # Table IV: which augmented views to generate (letters T/R/S; O always)
+        self.views = views.upper()
+        self.sub_ratio = sub_ratio
         # Access original dataset attributes through subset.dataset
         self.padding_idx = subset.dataset.padding_idx
         self._max_len = subset.dataset.poi_list.shape[1]
+        # Substitution view samples random valid POI ids in [1, vocab_hi]
+        self.vocab_hi = int(subset.dataset.poi_list.max().item())
 
     def __len__(self):
         return len(self.subset)
@@ -27,26 +34,27 @@ class TrajAugmenterWrapper(Dataset):
 
         # Generate augmented data
         if self.augment:
-            # Random cropping (maintain padding structure)
-            crop_poi, crop_length = self._random_crop(poi_np, valid_length)
-            # Reverse augmentation (maintain original padding positions)
-            reverse_poi = self._reverse_with_pad(poi_np, valid_length)
-
-            # Convert to Tensor
-            crop_poi = torch.LongTensor(crop_poi)
-            reverse_poi = torch.LongTensor(reverse_poi)
-
-            # Generate new masks
-            crop_mask = (crop_poi != self.padding_idx)
-            reverse_mask = (reverse_poi != self.padding_idx)
-
-            return {
+            item = {
                 'orig': (poi_seq, orig_mask),
-                'crop': (crop_poi, crop_mask),
-                'reverse': (reverse_poi, reverse_mask),
                 'user': user_label,
-                'lengths': (valid_length, crop_length, valid_length)
+                'lengths': (valid_length, valid_length, valid_length)
             }
+            # Random cropping (maintain padding structure)
+            if 'T' in self.views:
+                crop_poi, crop_length = self._random_crop(poi_np, valid_length)
+                crop_poi = torch.LongTensor(crop_poi)
+                item['crop'] = (crop_poi, (crop_poi != self.padding_idx))
+                item['crop_length'] = crop_length
+            # Reverse augmentation (maintain original padding positions)
+            if 'R' in self.views:
+                reverse_poi = torch.LongTensor(self._reverse_with_pad(poi_np, valid_length))
+                item['reverse'] = (reverse_poi, (reverse_poi != self.padding_idx))
+            # Substitution augmentation: replace ~15% of valid positions with
+            # random valid POI ids (revision R1.1/R2.5 third augmentation)
+            if 'S' in self.views:
+                subst_poi = torch.LongTensor(self._random_substitute(poi_np, valid_length))
+                item['subst'] = (subst_poi, (subst_poi != self.padding_idx))
+            return item
         else:
             return {
                 'orig': (poi_seq, orig_mask),
@@ -59,7 +67,7 @@ class TrajAugmenterWrapper(Dataset):
         if valid_length <= self.min_length:
             return seq.copy(), valid_length
 
-        crop_length = max(int(valid_length * 0.7), self.min_length)
+        crop_length = max(int(valid_length * self.crop_ratio), self.min_length)
         start = np.random.randint(0, valid_length - crop_length + 1)
 
         # Create new sequence and preserve padding
@@ -83,6 +91,17 @@ class TrajAugmenterWrapper(Dataset):
 
         return reversed_seq
 
+    def _random_substitute(self, seq, valid_length):
+        """Substitution view: replace ~sub_ratio of the valid positions with
+        random valid POI ids (padding structure preserved)."""
+        seq = np.array(seq, dtype=np.int64)
+        out = seq.copy()
+        if valid_length >= 2:
+            n_sub = max(int(valid_length * self.sub_ratio), 1)
+            pos = np.random.choice(valid_length, size=n_sub, replace=False)
+            out[pos] = np.random.randint(1, self.vocab_hi + 1, size=n_sub)
+        return out
+
 
 def aug_collate_fn(batch):
     """Unified collate function for processing augmented data"""
@@ -90,9 +109,10 @@ def aug_collate_fn(batch):
     orig_seq = []
     crop_seq = []
     reverse_seq = []
+    subst_seq = []
     users = []
-    masks = {'orig': [], 'crop': [], 'reverse': []}
-    lengths = {'orig': [], 'crop': [], 'reverse': []}
+    masks = {'orig': [], 'crop': [], 'reverse': [], 'subst': []}
+    lengths = {'orig': [], 'crop': [], 'reverse': [], 'subst': []}
     decoder_inputs = []  # Decoder input container
 
     # Unpack batch
@@ -101,24 +121,29 @@ def aug_collate_fn(batch):
         orig_poi = item['orig'][0]
         orig_seq.append(orig_poi)
         masks['orig'].append(item['orig'][1])
-        lengths['orig'].append(item['lengths'][0])  # Store int value directly
+        _len = item['lengths']
+        _vlen = _len[0] if isinstance(_len, (tuple, list)) else _len
+        lengths['orig'].append(_vlen)  # Store int value directly
 
         # Generate decoder input (key correction)
         seq = orig_poi.tolist()
-        valid_length = item['lengths'][0]  # Get int value directly, no need for .item()
+        valid_length = _vlen  # Get int value directly, no need for .item()
         decoder_seq = seq[:valid_length-1] + [0]*(len(seq)-(valid_length-1))
         decoder_inputs.append(torch.LongTensor(decoder_seq))
 
-        # Augmented data
+        # Augmented data (each view independent; Table IV subsets)
         if 'crop' in item:
-            crop_poi = item['crop'][0]
-            crop_seq.append(crop_poi)
+            crop_seq.append(item['crop'][0])
             masks['crop'].append(item['crop'][1])
-            reverse_poi = item['reverse'][0]
-            reverse_seq.append(reverse_poi)
+            lengths['crop'].append(item.get('crop_length', _len[1] if isinstance(_len, (tuple, list)) else _vlen))
+        if 'reverse' in item:
+            reverse_seq.append(item['reverse'][0])
             masks['reverse'].append(item['reverse'][1])
-            lengths['crop'].append(item['lengths'][1])
-            lengths['reverse'].append(item['lengths'][2])
+            lengths['reverse'].append(_vlen)
+        if 'subst' in item:
+            subst_seq.append(item['subst'][0])
+            masks['subst'].append(item['subst'][1])
+            lengths['subst'].append(_vlen)
 
         users.append(item['user'])
 
@@ -134,14 +159,17 @@ def aug_collate_fn(batch):
 
     # Add augmented data
     if len(crop_seq) > 0:
-        batch_dict.update({
-            'crop_seq': torch.stack(crop_seq),
-            'crop_mask': torch.stack(masks['crop']),
-            'crop_length': torch.tensor(lengths['crop']),
-            'reverse_seq': torch.stack(reverse_seq),
-            'reverse_mask': torch.stack(masks['reverse']),
-            'reverse_length': torch.tensor(lengths['reverse'])
-        })
+        batch_dict['crop_seq'] = torch.stack(crop_seq)
+        batch_dict['crop_mask'] = torch.stack(masks['crop'])
+        batch_dict['crop_length'] = torch.tensor(lengths['crop'])
+    if len(reverse_seq) > 0:
+        batch_dict['reverse_seq'] = torch.stack(reverse_seq)
+        batch_dict['reverse_mask'] = torch.stack(masks['reverse'])
+        batch_dict['reverse_length'] = torch.tensor(lengths['reverse'])
+    if len(subst_seq) > 0:
+        batch_dict['subst_seq'] = torch.stack(subst_seq)
+        batch_dict['subst_mask'] = torch.stack(masks['subst'])
+        batch_dict['subst_length'] = torch.tensor(lengths['subst'])
 
     return batch_dict
 
@@ -156,7 +184,7 @@ def get_embedding_vector(vec_path, embed_size):
     with open(vec_path, 'r') as f:
         for line in f.readlines():
             line_Arr = line.split()  # Split the line into a string list using space as delimiter
-            if len(line_Arr) < 100 or line_Arr[0] == '</s>':  # If list length is less than 100 or first element is '</s>', skip this line and move to next
+            if len(line_Arr) < embed_size + 1 or line_Arr[0] == '</s>':  # Skip header/invalid lines (POI id + embed_size dims)
                 continue
             out_vec.append(list(map(float, line_Arr[1:])))  # Append float list starting from second element to out_vec
         vec_tensor = torch.tensor(out_vec)  # Function converts out_vec to PyTorch tensor and returns it

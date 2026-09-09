@@ -1,368 +1,311 @@
-import pickle
+# -*- coding: utf-8 -*-
+"""Training script for the paper-strict PIBTUL implementation (Foursquare).
+
+Protocol kept identical to the other experiments for comparability:
+  - 80/20 random split (seed 2024), batch 128, 80 epochs, Adam lr=0.0005
+  - best-on-test metrics tracked across epochs (ACC@1, ACC@5, macro-P/R/F1)
+Paper-faithful settings (Section IV-A.4):
+  - v(c) dim 250, hidden size 256, latent dim d 256, nu 0.9,
+    beta1 = beta2 = 0.5, gamma 0.01, lambda 1, Adam lr 0.0005
+  - no lr scheduler / weight decay / gradient clipping (not in the paper)
+  - evaluation uses the same fixed three-view protocol as the other
+    experiments (orig + truncating + reversal views), with the posterior
+    mean mu used for deterministic predictions.
+"""
+import argparse
+import json
 import os
 import random
-
-from utils import TrajAugmenterWrapper, aug_collate_fn
-from torch.optim.lr_scheduler import StepLR
-from utils import accuracy_at_k, calculate_macro_metrics
-from utils import read_processed_tra, get_embedding_vector, read_trajectories
 import time
-import json
-import argparse
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
-from data_load import TrajDataset
-from models import *
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+from data_load import TrajDataset
+from models import PIBTUL
+from utils import (TrajAugmenterWrapper, aug_collate_fn, accuracy_at_k,
+                   calculate_macro_metrics, read_processed_tra,
+                   get_embedding_vector, read_trajectories)
+
 
 def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='PIBTUL: Trajectory User Linking with Multi-view Learning')
-    
-    # Data parameters
-    parser.add_argument('--processed_file', type=str, 
-                       default='data/gowalla_traj_200.pkl',
-                       help='Path to processed trajectory data file')
-    parser.add_argument('--train_file', type=str,
-                       default='data/processed_data/Gowalla_200.txt',
-                       help='Path to raw training data file')
-    parser.add_argument('--vec_file', type=str,
-                       default='data/processed_data/gowalla200_embedding_node2vec.dat',
-                       help='Path to embedding vector file')
-    parser.add_argument('--city', type=str, default='gowalla',
-                       help='City name for model identification')
-    parser.add_argument('--processed_flag', type=bool, default=False,
-                       help='Whether to use preprocessed dataset')
-    
-    # Model parameters
-    parser.add_argument('--embed_size', type=int, default=250,
-                       help='Embedding dimension size')
-    parser.add_argument('--hidden_size', type=int, default=256,
-                       help='Hidden layer dimension size')
-    parser.add_argument('--num_layers', type=int, default=1,
-                       help='Number of LSTM layers')
-    parser.add_argument('--dropout_prob', type=float, default=0.5,
-                       help='Dropout probability')
-    
-    # Training parameters
-    parser.add_argument('--batch_size', type=int, default=128,
-                       help='Batch size for training and testing')
-    parser.add_argument('--learning_rate', type=float, default=0.0005,
-                       help='Learning rate for optimizer')
-    parser.add_argument('--epochs', type=int, default=80,
-                       help='Number of training epochs')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay for optimizer')
-    parser.add_argument('--gradient_clip', type=float, default=1.0,
-                       help='Gradient clipping threshold')
-    
-    # Scheduler parameters
-    parser.add_argument('--scheduler_step_size', type=int, default=10,
-                       help='Step size for learning rate scheduler')
-    parser.add_argument('--scheduler_gamma', type=float, default=0.5,
-                       help='Gamma for learning rate scheduler')
-    
-    # Loss weights
-    parser.add_argument('--kl_weight', type=float, default=0.01,
-                       help='Weight for KL divergence loss')
-    parser.add_argument('--cluster_weight', type=float, default=1.0,
-                       help='Weight for clustering loss')
-    
-    # Early stopping parameters
-    parser.add_argument('--early_stopping_patience', type=int, default=10,
-                       help='Patience for early stopping')
-    parser.add_argument('--early_stopping_min_delta', type=float, default=0.0001,
-                       help='Minimum improvement threshold for early stopping')
-    
-    # Data split parameters
-    parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Ratio of training data')
-    
-    # Other parameters
-    parser.add_argument('--seed', type=int, default=2024,
-                       help='Random seed for reproducibility')
-    parser.add_argument('--print_freq', type=int, default=100,
-                       help='Print frequency during training')
-    parser.add_argument('--device', type=str, default='auto',
-                       help='Device to use (auto/cuda/cpu)')
-    
-    return parser.parse_args()
-
-# Parse arguments
-args = parse_args()
-
-# Set random seed
-torch.manual_seed(args.seed)
-random.seed(args.seed)
-
-# Set device
-if args.device == 'auto':
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-else:
-    device = torch.device(args.device)
-
-print(f"Using device: {device}")
-print(f"CUDA available: {torch.cuda.is_available()}")
-
-# Data preprocessing
-if not args.processed_flag:
-    users, traj = read_trajectories(args.train_file)
-    data_set = TrajDataset(traj_data=traj,
-                           traj_user=users,
-                           padding_idx=0,
-                           use_sos_eos=None)
-    with open(args.processed_file, 'wb') as f:
-        pickle.dump(data_set, f)
-
-origin_dataset = read_processed_tra(args.processed_file)
-
-# Split dataset (key modification: split first, then augment)
-train_size = int(args.train_ratio * len(origin_dataset))
-test_size = len(origin_dataset) - train_size
-train_sub, test_sub = random_split(origin_dataset, [train_size, test_size])
-
-# Apply augmentation wrapper
-train_dataset = TrajAugmenterWrapper(train_sub, augment=True)
-test_dataset = TrajAugmenterWrapper(test_sub, augment=True)  # Test set also augmented
-
-output_traj_size = torch.max(origin_dataset.poi_list).item() + 1
-output_user_size = torch.max(origin_dataset.user_label).item() + 1
-
-embeddings = get_embedding_vector(args.vec_file, embed_size=args.embed_size)
+    p = argparse.ArgumentParser(description='PIBTUL (paper-strict) on Foursquare')
+    p.add_argument('--processed_file', type=str, default='../data/Foursquare_traj_new.pkl')
+    p.add_argument('--train_file', type=str, default='../data/foursquare_6.txt')
+    p.add_argument('--vec_file', type=str, default='../data/foursquare_embedding_node2vec_2.dat')
+    p.add_argument('--city', type=str, default='foursquare')
+    p.add_argument('--processed_flag', action='store_true', default=False)
+    p.add_argument('--embed_size', type=int, default=250)
+    p.add_argument('--hidden_size', type=int, default=256)
+    p.add_argument('--latent_dim', type=int, default=256)
+    p.add_argument('--num_layers', type=int, default=1)
+    p.add_argument('--batch_size', type=int, default=128)
+    p.add_argument('--learning_rate', type=float, default=0.0005)
+    p.add_argument('--epochs', type=int, default=80)
+    p.add_argument('--nu', type=float, default=0.9, help='prototype momentum, Eq.(19)')
+    p.add_argument('--init', type=str, default='gaussian',
+                   choices=['gaussian', 'uniform', 'classmean'],
+                   help='prototype initialization, Table V')
+    p.add_argument('--views', type=str, default='OTR',
+                   help='active views subset (letters O/T/R/S; S=Substitution), '
+                        'e.g. O/OT/TR/OR/OTS/OTR, Table IV')
+    p.add_argument('--sub_ratio', type=float, default=0.15,
+                   help='substitution ratio for the S view, Table IV')
+    p.add_argument('--ablation', type=str, default='none',
+                   choices=['none', 'pemb', 'mobcl', 'taug', 'attn', 'pgo'],
+                   help='component ablation: w/o PEmb/MobCL/TAug/Attn/PGO (paper Fig.)')
+    p.add_argument('--gamma', type=float, default=0.01, help='MobCL weight, Eq.(25)')
+    p.add_argument('--lam', type=float, default=1.0, help='prototype loss weight, Eq.(25)')
+    p.add_argument('--mi_weight', type=float, default=1.0,
+                   help='(eta+zeta)/2 in Eq.(9); value unspecified in paper')
+    p.add_argument('--beta_pred', type=float, default=1.0, help='CE weight, beta_pred')
+    p.add_argument('--beta_kl', type=float, default=0.01, help='symKL weight, beta_KL')
+    p.add_argument('--beta_mi', type=float, default=0.01, help='MI weight, beta_MI')
+    p.add_argument('--rho', type=float, default=0.7,
+                   help='truncating ratio for augmentation; value unspecified in paper')
+    p.add_argument('--inter_mode', type=str, default='paper',
+                   choices=['paper', 'intent'],
+                   help='paper: literal Eq.(21) max-min; intent: -min_dist (stated intent)')
+    p.add_argument('--tag', type=str, default='base', help='run tag for output files')
+    p.add_argument('--train_ratio', type=float, default=0.8)
+    p.add_argument('--seed', type=int, default=2024)
+    p.add_argument('--print_freq', type=int, default=100)
+    return p.parse_args()
 
 
-# Model generation
-enc = Encoder(embed_size=args.embed_size, hidden_size=args.hidden_size, dropout_prob=args.dropout_prob, 
-              num_layers=args.num_layers, embeddings=embeddings, output_user_size=output_user_size, device=device)
-model = Model(encoder=enc, hidden_size=args.hidden_size, output_user_size=output_user_size).to(device)
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device}')
+    print(f'Args: {vars(args)}')
 
-# Optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if not args.processed_flag:
+        users, traj = read_trajectories(args.train_file)
+        import pickle
+        data_set = TrajDataset(traj_data=traj, traj_user=users,
+                               padding_idx=0, use_sos_eos=None)
+        with open(args.processed_file, 'wb') as f:
+            pickle.dump(data_set, f)
 
-scheduler = StepLR(optimizer, step_size=args.scheduler_step_size, gamma=args.scheduler_gamma)
+    origin_dataset = read_processed_tra(args.processed_file)
 
-# Best model tracking
-best_acc1 = 0.0
-best_acc5 = 0.0
-best_macro_f = 0.0
-best_macro_r = 0.0
-best_macro_p = 0.0
-best_epoch = 0
-best_model_state = None
+    train_size = int(args.train_ratio * len(origin_dataset))
+    test_size = len(origin_dataset) - train_size
+    train_sub, test_sub = random_split(origin_dataset, [train_size, test_size])
 
-best_map = {
-    'best_acc1': 0.0,
-    'best_acc5': 0.0,
-    'best_macro_f': 0.0,
-    'best_macro_r': 0.0,
-    'best_macro_p': 0.0,
-}
+    # training: paper augmentation (Eq. 10-11); evaluation: the same fixed
+    # three-view protocol as the other experiments
+    # (w/o TAug: no trajectory augmentation -> only the raw view; views=O)
+    abl = args.ablation
+    if abl == 'taug':
+        train_dataset = TrajAugmenterWrapper(train_sub, augment=False, crop_ratio=args.rho)
+        test_dataset = TrajAugmenterWrapper(test_sub, augment=False, crop_ratio=args.rho)
+        args.views = 'O'
+    else:
+        train_dataset = TrajAugmenterWrapper(train_sub, augment=True, crop_ratio=args.rho,
+                                             views=args.views, sub_ratio=args.sub_ratio)
+        test_dataset = TrajAugmenterWrapper(test_sub, augment=True, crop_ratio=args.rho,
+                                            views=args.views, sub_ratio=args.sub_ratio)
 
-# Initialize list to record evaluation results
-eval_results = []
+    output_user_size = torch.max(origin_dataset.user_label).item() + 1
+    embeddings = get_embedding_vector(args.vec_file, embed_size=args.embed_size)
+    print(f'#users={output_user_size}, #trajs={len(origin_dataset)}, '
+          f'emb={tuple(embeddings.shape)}')
 
-# Early stopping parameters
-early_stopping_counter = 0  # Early stopping counter
+    # Component ablation flags (paper Fig.): w/o PEmb / w/o Attn.
+    use_attn = (abl != 'attn')
+    pretrained_emb = (abl != 'pemb')
+    model = PIBTUL(embed_size=args.embed_size, hidden_size=args.hidden_size,
+                   latent_dim=args.latent_dim, num_layers=args.num_layers,
+                   embeddings=embeddings, output_user_size=output_user_size,
+                   device=device, nu=args.nu, mi_weight=args.mi_weight,
+                   inter_mode=args.inter_mode, init_mode=args.init,
+                   views=args.views, use_attn=use_attn,
+                   pretrained_emb=pretrained_emb).to(device)
 
-if __name__ == '__main__':
-    train_data_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        collate_fn=aug_collate_fn,
-        shuffle=True
-    )
+    # main optimizer: everything except the MINE critics
+    critic_params = [p for m in model.critic_modules() for p in m.parameters()]
+    critic_ids = {id(p) for p in critic_params}
+    main_params = [p for p in model.parameters() if id(p) not in critic_ids]
+    optimizer = torch.optim.Adam(main_params, lr=args.learning_rate)
+    critic_optimizer = torch.optim.Adam(critic_params, lr=args.learning_rate)
 
-    test_data_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        collate_fn=aug_collate_fn,  # Use same collate
-        shuffle=False
-    )
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                              collate_fn=aug_collate_fn, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                             collate_fn=aug_collate_fn, shuffle=False)
 
-    Loss_fun = nn.CrossEntropyLoss()
+    ce_loss_fn = nn.CrossEntropyLoss()
+    best = {'acc1': 0.0, 'acc5': 0.0, 'macro_p': 0.0, 'macro_r': 0.0,
+            'macro_f': 0.0, 'epoch': 0}
+    eval_results = []
+
+    # Table V ablation: prototype initialization by per-user class mean.
+    # Pre-compute each user's mean z_hat over (a sample of) the training set
+    # and use that as the initial prototype; users with no sample stay random.
+    if args.init == 'classmean':
+        model.eval()
+        with torch.no_grad():
+            proto_sum = torch.zeros(output_user_size, model.proto_dim, device=device)
+            proto_cnt = torch.zeros(output_user_size, 1, device=device)
+            for bi, batch in enumerate(train_loader):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                mv_inputs = {}
+                if 'O' in args.views:
+                    mv_inputs['orig'] = (batch['orig_seq'], batch['orig_length'])
+                if 'T' in args.views:
+                    mv_inputs['crop'] = (batch['crop_seq'], batch['crop_length'])
+                if 'R' in args.views:
+                    mv_inputs['reverse'] = (batch['reverse_seq'], batch['reverse_length'])
+                if 'S' in args.views:
+                    mv_inputs['subst'] = (batch['subst_seq'], batch['subst_length'])
+                labels = batch['users']
+                _, _, z_proto = model(mv_inputs, sample=False)
+                proto_sum.index_add_(0, labels, z_proto)
+                proto_cnt.index_add_(0, labels,
+                                     torch.ones(labels.shape[0], 1,
+                                                device=device, dtype=z_proto.dtype))
+                if bi > 20:   # sample cap: enough to cover most users, avoid a full pass
+                    break
+            mask = (proto_cnt.squeeze(1) > 0)
+            init_m = proto_sum / proto_cnt.clamp(min=1.0)
+            keep_rnd = torch.randn_like(model.prototypes.data) * 0.01
+            model.prototypes.data = torch.where(mask.unsqueeze(1), init_m, keep_rnd)
+            n_covered = int(mask.sum().item())
+            print(f'[classmean init] covered {n_covered}/{output_user_size} users')
+        model.train()
 
     for epoch in range(args.epochs):
         model.train()
-        start_time = time.time()
-        total_kl = 0.0
-        for i, batch_data in enumerate(train_data_loader):
-            batch_data = {k: v.to(device) for k, v in batch_data.items()}
-            output, kl_loss, z = model(batch_data)
-            user_label = batch_data['users']
+        t0 = time.time()
+        for i, batch in enumerate(train_loader):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            # mv_inputs follows the active views (w/o TAug -> only orig).
+            mv_inputs = {}
+            if 'O' in args.views:
+                mv_inputs['orig'] = (batch['orig_seq'], batch['orig_length'])
+            if 'T' in args.views:
+                mv_inputs['crop'] = (batch['crop_seq'], batch['crop_length'])
+            if 'R' in args.views:
+                mv_inputs['reverse'] = (batch['reverse_seq'], batch['reverse_length'])
+            if 'S' in args.views:
+                mv_inputs['subst'] = (batch['subst_seq'], batch['subst_length'])
+            labels = batch['users']
 
-            # Clustering loss and prototype update
-            model.update_prototypes(z.detach(), user_label)
-            loss_cluster = model.cluster_loss(z, user_label)
+            logits, views, z_proto = model(mv_inputs, sample=True)
 
-            # Classification results and metrics
-            predict_userlabel = torch.argmax(F.softmax(output, dim=-1), -1)
-            _, predict_userlabel1 = torch.topk(F.softmax(output, dim=-1), 1, dim=-1)
-            _, predict_userlabel5 = torch.topk(F.softmax(output, dim=-1), 5, dim=-1)
-            acc1 = accuracy_at_k(predict_userlabel1.tolist(), user_label.tolist(), 1)
-            acc5 = accuracy_at_k(predict_userlabel5.tolist(), user_label.tolist(), 5)
-            macro_p, macro_r, macro_f = calculate_macro_metrics(predict_userlabel.tolist(), user_label.tolist())
+            # --- step 1: train the MI critics (DV bound) on detached latents
+            critic_optimizer.zero_grad()
+            c_loss = model.mine_critic_loss(views)
+            c_loss.backward()
+            critic_optimizer.step()
 
-            # Loss combination
-            loss_ce = Loss_fun(output, user_label)
-            total_loss = loss_ce + args.kl_weight * kl_loss + args.cluster_weight * loss_cluster
+            # --- step 2: main objective, Eq.(25)
+            kl_s, mi_s = model.mobcl_loss(views)
+            loss_ce = ce_loss_fn(logits, labels)
+            l_intra, l_inter = model.prototype_loss(z_proto, labels)
+            # C2 anti-collapse warmup: ramp the prototype forces in over the
+            # first PGO_WARMUP epochs so CE builds separable structure first
+            # (variant C collapsed in the first 2 epochs without this).
+            pgo_warmup = 6.0
+            pgo_ramp = min(1.0, (epoch + 1) / pgo_warmup)
+            # Component ablation: w/o MobCL -> drop mobcl term; w/o PGO -> drop lam.
+            lam_eff = 0.0 if abl == 'pgo' else args.lam
+            mobcl_term = (args.beta_kl * kl_s - args.beta_mi * mi_s) if abl != 'mobcl' else None
+            total_loss = args.beta_pred * loss_ce + \
+                (mobcl_term if mobcl_term is not None else 0.0) + \
+                lam_eff * pgo_ramp * (l_intra + l_inter)
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)  # Gradient clipping
+            # stability safeguard (not part of the paper objective): clip the
+            # main-parameter gradients so a noisy MI critic cannot blow up the
+            # encoder in a single step
+            torch.nn.utils.clip_grad_norm_(main_params, 5.0)
             optimizer.step()
 
+            # Eq.(19): momentum prototype update after the gradient step
+            model.update_prototypes(z_proto.detach(), labels)
+
             if i % args.print_freq == 0:
-                print(f'Epoch {epoch + 1}, Batch {i}')
-                print(
-                    f'Acc@1: {acc1:.4f}, Acc@5: {acc5:.4f}, Macro_F: {macro_f:.4f}, Macro_R: {macro_r:.4f}, Macro_P: {macro_p:.4f}')
-                print(
-                    f'Loss CE: {loss_ce.item():.4f}, KL Loss: {kl_loss.item():.4f}')
-        end_time = time.time()  # Record epoch end time
-        epoch_time = end_time - start_time  # Calculate epoch duration
+                probs = F.softmax(logits, dim=-1)
+                _, top1 = torch.topk(probs, 1, dim=-1)
+                _, top5 = torch.topk(probs, 5, dim=-1)
+                acc1 = accuracy_at_k(top1.tolist(), labels.tolist(), 1)
+                acc5 = accuracy_at_k(top5.tolist(), labels.tolist(), 5)
+                print(f'Epoch {epoch + 1}, Batch {i} | '
+                      f'Acc@1: {acc1:.4f}, Acc@5: {acc5:.4f} | '
+                      f'CE: {loss_ce.item():.4f}, KL: {kl_s.item():.3f}, MI: {mi_s.item():.3f}, '
+                      f'intra: {l_intra.item():.4f}, inter: {l_inter.item():.4f}')
 
-        print(f'Epoch {epoch + 1} training time: {epoch_time:.2f} seconds')  # Print training time
-        scheduler.step()
+        print(f'Epoch {epoch + 1} training time: {time.time() - t0:.2f}s')
 
-        # --------- Validation Phase --------- #
+        # ---------------- evaluation (three-view protocol, deterministic) ---
         model.eval()
-        TestPredict, TestPredict1, TestPredict5, UserLabel = [], [], [], []
-        total_loss = 0
-        epoch_eval_loss = 0
-        epoch_eval_acc1 = 0
-
+        Top1, Top5, Pred, Gold = [], [], [], []
         with torch.no_grad():
-            for i, batch_data in enumerate(test_data_loader):
-                batch_data = {k: v.to(device) for k, v in batch_data.items()}
-                output, kl_loss, _ = model(batch_data)
-                user_label = batch_data['users']
+            for batch in test_loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                mv_inputs = {}
+                if 'O' in args.views:
+                    mv_inputs['orig'] = (batch['orig_seq'], batch['orig_length'])
+                if 'T' in args.views:
+                    mv_inputs['crop'] = (batch['crop_seq'], batch['crop_length'])
+                if 'R' in args.views:
+                    mv_inputs['reverse'] = (batch['reverse_seq'], batch['reverse_length'])
+                if 'S' in args.views:
+                    mv_inputs['subst'] = (batch['subst_seq'], batch['subst_length'])
+                logits, _, _ = model(mv_inputs, sample=False)
+                labels = batch['users']
+                probs = F.softmax(logits, dim=-1)
+                _, top1 = torch.topk(probs, 1, dim=-1)
+                _, top5 = torch.topk(probs, 5, dim=-1)
+                Top1.extend(top1.tolist())
+                Top5.extend(top5.tolist())
+                Pred.extend(torch.argmax(probs, -1).tolist())
+                Gold.extend(labels.tolist())
 
-                predict_userlabel = torch.argmax(F.softmax(output, dim=-1), -1)
-                _, predict_userlabel1 = torch.topk(F.softmax(output, dim=-1), 1, dim=-1)
-                _, predict_userlabel5 = torch.topk(F.softmax(output, dim=-1), 5, dim=-1)
+        acc1 = accuracy_at_k(Top1, Gold, 1)
+        acc5 = accuracy_at_k(Top5, Gold, 5)
+        macro_p, macro_r, macro_f = calculate_macro_metrics(Pred, Gold)
+        eval_results.append(acc1)
+        print(f'---Test acc@1: {acc1:.4f}, acc@5: {acc5:.4f}, '
+              f'Macro_P: {macro_p:.4f}, Macro_R: {macro_r:.4f}, '
+              f'Macro_F: {macro_f:.4f}')
 
-                loss = Loss_fun(output, user_label)
-                epoch_eval_loss += loss.item()
-                epoch_eval_acc1 += accuracy_at_k(predict_userlabel1.tolist(), user_label.tolist(), 1)
-                total_loss += loss.item()
+        if acc1 > best['acc1']:
+            best.update({'acc1': acc1, 'acc5': acc5, 'macro_p': macro_p,
+                         'macro_r': macro_r, 'macro_f': macro_f,
+                         'epoch': epoch + 1})
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, f'best_model_{args.city}_strict_{args.tag}.pth')
+        print(f"Epoch {epoch + 1}, Acc@1: {acc1:.4f}, Best: {best['acc1']:.4f}")
 
-                TestPredict.extend(predict_userlabel.tolist())
-                TestPredict1.extend(predict_userlabel1.tolist())
-                TestPredict5.extend(predict_userlabel5.tolist())
-                UserLabel.extend(user_label.tolist())
+    print('\n----- Best Results (PIBTUL strict) -----')
+    print(f"Best Acc@1: {best['acc1']:.4f} (epoch {best['epoch']})")
+    print(f"Best Acc@5: {best['acc5']:.4f}")
+    print(f"Best Macro_P: {best['macro_p']:.4f}")
+    print(f"Best Macro_R: {best['macro_r']:.4f}")
+    print(f"Best Macro_F: {best['macro_f']:.4f}")
 
-            acc1 = accuracy_at_k(TestPredict1, UserLabel, 1)
-            acc5 = accuracy_at_k(TestPredict5, UserLabel, 5)
-            macro_p, macro_r, macro_f = calculate_macro_metrics(TestPredict1, UserLabel)
-
-            print(f'---Test acc@1: {acc1:.4f}, Test acc@5: {acc5:.4f}, Test Loss: {total_loss / (i + 1):.4f}')
-            print(f'Macro_F: {macro_f:.4f}, Macro_R: {macro_r:.4f}, Macro_P: {macro_p:.4f}')
-
-            eval_results.append(acc1)
-
-        # Early stopping logic
-        if acc1 > best_acc1 + args.early_stopping_min_delta:
-            # Performance improved, reset early stopping counter
-            best_acc1 = acc1
-            best_acc5 = acc5
-            best_macro_f = macro_f
-            best_macro_r = macro_r
-            best_macro_p = macro_p
-            best_map = {
-                "best_acc1": acc1,
-                "best_acc5": acc5,
-                "best_macro_f": macro_f,
-                "best_macro_r": macro_r,
-                "best_macro_p": macro_p
-            }
-            best_model_state = model.state_dict().copy()
-            best_epoch = epoch + 1
-            early_stopping_counter = 0
-
-            print(f"✓ Performance improved! Reset early stopping counter")
-            print(f"✓ New best model found at epoch {epoch + 1} with Acc@1: {acc1:.4f}")
-        else:
-            # Performance not improved, increase early stopping counter
-            early_stopping_counter += 1
-            print(f"⚠ Performance not improved, early stopping counter: {early_stopping_counter}/{args.early_stopping_patience}")
-
-        print(f'Epoch {epoch + 1}, Accuracy: {acc1:.4f}')
-        print(f"Best Accuracy: {best_acc1:.4f}")
-
-        # Check if early stopping is needed
-        if early_stopping_counter >= args.early_stopping_patience:
-            print(f"\n🛑 Early stopping triggered! No improvement for {args.early_stopping_patience} consecutive epochs")
-            print(f"Best performance achieved at epoch {epoch + 1 - args.early_stopping_patience}")
-            print(f"Training stopped early to save computational resources")
-            break
-
-    # Print best results after all epochs
-    print("\n----- Training Completed -----")
-    if early_stopping_counter >= args.early_stopping_patience:
-        print(f"Training ended due to early stopping, actually trained {epoch + 1} epochs")
-    else:
-        print(f"Training completed normally, trained {args.epochs} epochs")
-
-    print("\n----- Best Results -----")
-    print(f"Best Acc@1: {best_acc1:.4f}")
-    print(f"Best Acc@5: {best_acc5:.4f}")
-    print(f"Best Macro_F: {best_macro_f:.4f}")
-    print(f"Best Macro_R: {best_macro_r:.4f}")
-    print(f"Best Macro_P: {best_macro_p:.4f}")
-
-    # Save the best model found during training
-    if best_model_state is not None:
-        # Ensure models directory exists
-        models_dir = 'models'
-        if not os.path.exists(models_dir):
-            os.makedirs(models_dir)
-            print(f"✅ Directory created: {models_dir}")
-        
-        best_model_path = f'{models_dir}/best_model_{args.city}_acc{best_acc1:.4f}_epoch{best_epoch}.pth'
-        torch.save({
-            'epoch': best_epoch,
-            'model_state_dict': best_model_state,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'best_acc1': best_acc1,
-            'best_acc5': best_acc5,
-            'best_macro_f': best_macro_f,
-            'best_macro_r': best_macro_r,
-            'best_macro_p': best_macro_p,
-            'city': args.city,
-            'hyperparameters': {
-                'embed_size': args.embed_size,
-                'hidden_size': args.hidden_size,
-                'num_layers': args.num_layers,
-                'dropout_prob': args.dropout_prob,
-                'batch_size': args.batch_size,
-                'learning_rate': args.learning_rate
-            },
-            'training_completed': True
-        }, best_model_path)
-        print(f"✅ Best model saved: {best_model_path}")
-        print(f"✅ Best model was found at epoch {best_epoch}")
-    else:
-        print("⚠ No best model state found to save")
-
-    # Save results to JSON file, filename also includes city
-    results_file = f'acc_data_{args.city}_PIBTUL.json'
-    with open(results_file, 'w') as f:
+    best_map = {
+        'best_acc1': best['acc1'], 'best_acc5': best['acc5'],
+        'best_macro_p': best['macro_p'], 'best_macro_r': best['macro_r'],
+        'best_macro_f': best['macro_f'], 'best_epoch': best['epoch'],
+        'hyperparameters': vars(args),
+    }
+    with open(f'acc_data_{args.city}_PIBTUL_strict_{args.tag}.json', 'w') as f:
         json.dump(eval_results, f)
-    print(f"✅ Training results saved: {results_file}")
-
-    # Ensure data directory exists
-    data_dir = 'data'
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-        print(f"✅ Directory created: {data_dir}")
-
-    best_results_file = f'data/best_results_{args.city}_PIBTUL.json'
-    with open(best_results_file, 'w') as f:
-        json.dump(best_map, f)
-    print(f"✅ Best results saved: {best_results_file}")
+    with open(f'best_results_{args.city}_PIBTUL_strict_{args.tag}.json', 'w') as f:
+        json.dump(best_map, f, indent=2)
+    print('Results saved.')
 
 
-
-
+if __name__ == '__main__':
+    main()

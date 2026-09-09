@@ -1,11 +1,10 @@
 import torch
-from torch.utils.data import TensorDataset
+from torch.utils.data import Dataset
 
 
 
-class TrajDataset(TensorDataset):
+class TrajDataset(Dataset):
     def __init__(self, traj_data, traj_user, padding_idx, use_sos_eos):
-        # Don't call super().__init__() here as we're building tensors manually
         # Read data files
         self.data = traj_data
         self.user = traj_user
